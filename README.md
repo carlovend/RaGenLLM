@@ -1,4 +1,4 @@
-# RaGenLLM  
+# RaGenLLM  (REFACTOR IN PROGRESS - CODE NOT COMPLETE)
 Retrieval-Augmented LLM Framework for Automated Proof-of-Concept Generation
 
 RaGenLLM is a modular framework that combines vulnerability scanning, retrieval-augmented generation (RAG), and local large language models (LLMs) to automatically synthesize and verify Proof-of-Concept (PoC) exploits in controlled environments.  
