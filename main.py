@@ -1,86 +1,117 @@
+
 #!/usr/bin/env python3
-"""
-RaGenLLM - Main Orchestrator
+import sys
+import os
 
-This script coordinates the full RaGenLLM pipeline.
-Currently, it handles:
-    - Nmap scanning
-    - HTTP probing
-    - Optional Nuclei scanning
-    - Optional SQLMap-light scanning
+# Ensure src is in python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-Future extensions will add:
-    - Retrieval (RAG)
-    - PoC generation
-    - Sandbox execution
-    - Refinement loop
-"""
+from src.core.logger import get_logger
+from src.core.printer import print_summary
+from src.scanning.nmap_runner import NmapRunner
+from src.scanning.nuclei_runner import NucleiRunner
+from src.scanning.utils import extract_cves_from_nuclei_finding
+from src.orchestration.feedback_manager import FeedbackManager
 
-import argparse
-import json
-from pathlib import Path
-
-from scanner import Scanner
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="RaGenLLM - Automated PoC Generation Framework (scanner stage)")
-    parser.add_argument("--ip", required=True, help="Target IP or hostname")
-    parser.add_argument("--ports", default="1-10000", help="Ports to scan (default: 1-10000)")
-    parser.add_argument("--fast", action="store_true", help="Fast mode (skip Nuclei and SQLMap)")
-    parser.add_argument("--no-nuclei", action="store_true", help="Disable Nuclei even if not in fast mode")
-    parser.add_argument("--sqlmap", action="store_true", help="Enable SQLMap-light on candidate URLs")
-    parser.add_argument("--out", default="scan_results.json", help="Path to output JSON file")
-
-    return parser.parse_args()
-
-
-def print_services_summary(services):
-    print("\n========== SCAN SUMMARY ==========")
-    for idx, s in enumerate(services, start=1):
-        print(f"\n[{idx}] {s.get('ip')}:{s.get('port')}")
-        print(f"  Product: {s.get('normalized_product') or s.get('product')}")
-        print(f"  Version: {s.get('version')}")
-        print(f"  Confidence: {s.get('confidence')}/10")
-        print(f"  HTTP reachable: {(s.get('http_probe') or {}).get('reachable')}")
-        if s.get("cves"):
-            print(f"  CVEs: {', '.join(s['cves'])}")
-        if s.get("nuclei_findings"):
-            print(f"  Nuclei findings: {len(s['nuclei_findings'])}")
-
+logger = get_logger("Main")
 
 def main():
-    args = parse_args()
+    print("🚀 Tesi API Refactored - PoC Generator")
+    print("=" * 50)
 
-    print("\n=== RaGenLLM :: Scanner Stage ===")
-    print(f"Target  : {args.ip}")
-    print(f"Ports   : {args.ports}")
-    print(f"Fast    : {args.fast}")
-    print(f"Nuclei  : {not args.no_nuclei}")
-    print(f"SQLMap  : {args.sqlmap}")
+    # 1. Input
+    try:
+        ip = input("Target IP: ").strip()
+        ports = input("Target Port(s): ").strip()
+        if not ip or not ports:
+            logger.error("IP and Port are required.")
+            return
+    except KeyboardInterrupt:
+        return
 
-    scanner = Scanner(
-        enable_nuclei=not args.no_nuclei and not args.fast,
-        enable_sqlmap=args.sqlmap and not args.fast,
-        fast=args.fast,
-    )
+    # 2. Scanning Phase
+    logger.info("Starting Nmap Scan...")
+    nmap_runner = NmapRunner()
+    services = nmap_runner.scan(ip, ports)
+    
+    if not services:
+        logger.warning("No services found.")
+        return
 
-    services, sqli_bundle = scanner.run(args.ip, args.ports)
+    # 3. Nuclei Phase
+    logger.info("Running Nuclei on http services...")
+    nuclei_runner = NucleiRunner()
+    
+    for svc in services:
+        # Check if HTTP-like or just try blindly if it has an http probe or common port
+        if svc.get("http_probe", {}).get("reachable") or svc.get("port") in {80, 443, 8080}:
+            url = f"http://{svc['ip']}:{svc['port']}" # Simplified
+            
+            # Better scheme detection logic
+            if svc.get("port") in {443, 8443} or "ssl" in svc.get("name", ""):
+                 url = f"https://{svc['ip']}:{svc['port']}"
 
-    print_services_summary(services)
+            logger.info(f"Scanning {url} with Nuclei...")
+            findings = nuclei_runner.scan(url)
+            svc['nuclei_findings'] = findings
+            
+            # Extract CVEs from Nuclei and merge with Nmap's
+            for f in findings:
+                cves = extract_cves_from_nuclei_finding(f)
+                if cves:
+                    current_cves = set(svc.get('cves', []))
+                    current_cves.update(cves)
+                    svc['cves'] = list(current_cves)
 
-    # ---- Save results ----
-    output_path = Path(args.out)
-    payload = {
-        "target": args.ip,
-        "ports": args.ports,
-        "services": services,
-        "sqli_bundle": sqli_bundle,
-    }
+    # 4. Print Detailed Summary (Restored Feature)
+    print_summary(services)
 
-    output_path.write_text(json.dumps(payload, indent=2))
-    print(f"\nResults saved to: {output_path.resolve()}")
+    # 5. Selection Loop
+    while True:
+        try:
+            choice = input("\nSelect service index to exploit (or 'q' to quit): ").strip()
+            if choice.lower() == 'q':
+                break
+            
+            if not choice.isdigit() or not (1 <= int(choice) <= len(services)):
+                print("Invalid selection.")
+                continue
 
+            selected_svc = services[int(choice) - 1]
+            cves = selected_svc.get("cves", [])
+
+            # Allow manual CVE entry regardless of findings
+            print(f"Detected CVEs: {', '.join(cves) if cves else 'None'}")
+            manual_cve = input("Enter a specific CVE to test (or enter to use detected only): ").strip()
+            if manual_cve:
+                manual_cve = manual_cve.upper()
+                if cves:
+                    # If we already have CVEs, ask if we want to isolate the manual one
+                    overwrite = input(f"Run ONLY {manual_cve}? (Y/n - 'n' adds it to the list): ").strip().lower()
+                    if overwrite in ["", "y", "yes"]:
+                        cves = [manual_cve]
+                    else:
+                        # Add to list but prioritize it at the beginning
+                        if manual_cve in cves:
+                            cves.remove(manual_cve)
+                        cves.insert(0, manual_cve)
+                else:
+                    cves = [manual_cve]
+
+            if not cves:
+                logger.warning("No CVEs to test.")
+                continue
+
+            # 6. Feedback Loop
+            fb_manager = FeedbackManager()
+            for cve in cves:
+                print(f"\n--- Testing {cve} ---")
+                fb_manager.run_feedback_loop(selected_svc, cve)
+
+        except KeyboardInterrupt:
+            break
+
+    print("Goodbye.")
 
 if __name__ == "__main__":
     main()
